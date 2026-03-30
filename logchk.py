@@ -38,6 +38,11 @@ DEFAULT_BOT_PATTERNS = [
     r"chatgpt-user",
     r"perplexitybot",
     r"cohere-ai",
+    r"newslookup",
+    r"security",
+    r"censys",
+    r"measure",
+    r"checker"
 ]
 
 LOG_PATTERN = re.compile(
@@ -61,6 +66,7 @@ class LogEntry:
     parsed: bool
     remote_ip: str | None = None
     status: str | None = None
+    referer: str | None = None
     user_agent: str | None = None
     request: RequestInfo | None = None
     filtered_reason: str | None = None
@@ -81,6 +87,8 @@ class Summary:
     filtered_bots: int = 0
     filtered_non_200: int = 0
     filtered_high_unsuccessful_ips: int = 0
+    filtered_low_successful_ips: int = 0
+    filtered_referer: int = 0
 
 
 def parse_request(request: str) -> RequestInfo | None:
@@ -106,6 +114,7 @@ def parse_log_line(line: str) -> LogEntry:
         parsed=True,
         remote_ip=match.group("remote"),
         status=match.group("status"),
+        referer=match.group("referer"),
         user_agent=match.group("user_agent"),
         request=request,
     )
@@ -114,6 +123,12 @@ def parse_log_line(line: str) -> LogEntry:
 def build_bot_regex(custom_patterns: list[str]) -> re.Pattern[str]:
     patterns = DEFAULT_BOT_PATTERNS + custom_patterns
     return re.compile("|".join(f"(?:{pattern})" for pattern in patterns), re.IGNORECASE)
+
+
+def referer_contains_required(entry: LogEntry, required_substring: str) -> bool:
+    if not entry.referer:
+        return False
+    return required_substring.lower() in entry.referer.lower()
 
 
 def tally_ip_stats(entries: Iterable[LogEntry]) -> dict[str, IpStats]:
@@ -136,8 +151,10 @@ def tally_ip_stats(entries: Iterable[LogEntry]) -> dict[str, IpStats]:
 def apply_filters(
     entries: list[LogEntry],
     bot_regex: re.Pattern[str],
+    required_referer_substring: str,
     ip_stats: dict[str, IpStats],
     unsuccessful_threshold: int,
+    successful_threshold: int,
 ) -> tuple[list[LogEntry], list[LogEntry], Summary]:
     summary = Summary(total_lines=len(entries))
     kept: list[LogEntry] = []
@@ -171,17 +188,36 @@ def apply_filters(
 
         stage_2.append(entry)
 
-    # Pass 3: filter IPs with more than threshold unsuccessful entries.
+    # Pass 3: filter IPs outside unsuccessful/successful thresholds.
+    stage_3: list[LogEntry] = []
     for entry in stage_2:
         remote_ip = entry.remote_ip
         if not remote_ip:
-            kept.append(entry)
+            stage_3.append(entry)
             continue
 
-        unsuccessful = ip_stats.get(remote_ip, IpStats()).unsuccessful
+        ip_count = ip_stats.get(remote_ip, IpStats())
+        unsuccessful = ip_count.unsuccessful
+        successful = ip_count.successful
         if unsuccessful > unsuccessful_threshold:
             entry.filtered_reason = "ip_unsuccessful_threshold"
             summary.filtered_high_unsuccessful_ips += 1
+            filtered.append(entry)
+            continue
+
+        if successful < successful_threshold:
+            entry.filtered_reason = "ip_successful_threshold"
+            summary.filtered_low_successful_ips += 1
+            filtered.append(entry)
+            continue
+
+        stage_3.append(entry)
+
+    # Pass 4: keep only entries whose referer contains the required substring.
+    for entry in stage_3:
+        if not referer_contains_required(entry, required_referer_substring):
+            entry.filtered_reason = "missing_required_referer_substring"
+            summary.filtered_referer += 1
             filtered.append(entry)
             continue
 
@@ -215,10 +251,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Additional case-insensitive regex pattern for bot/scanner user-agents. Repeatable.",
     )
     parser.add_argument(
+        "--required-referer-substring",
+        default="kapre.in",
+        help="Pass 4 keeps only entries whose referer contains this substring. Defaults to kapre.in.",
+    )
+    parser.add_argument(
         "--unsuccessful-threshold",
         type=int,
         default=2,
         help="Filter IPs with more than this number of unsuccessful requests. Defaults to 2.",
+    )
+    parser.add_argument(
+        "--successful-threshold",
+        type=int,
+        default=0,
+        help="Filter IPs with fewer than this number of successful requests. Defaults to 0.",
     )
     parser.add_argument("--summary", action="store_true", help="Print summary and IP tallies to stderr")
     return parser
@@ -235,6 +282,11 @@ def print_summary(summary: Summary, ip_stats: dict[str, IpStats]) -> None:
         f"Filtered by IP unsuccessful threshold: {summary.filtered_high_unsuccessful_ips}",
         file=sys.stderr,
     )
+    print(
+        f"Filtered by IP successful threshold: {summary.filtered_low_successful_ips}",
+        file=sys.stderr,
+    )
+    print(f"Filtered by missing required referer substring: {summary.filtered_referer}", file=sys.stderr)
 
     print("IP tallies:", file=sys.stderr)
     for remote_ip in sorted(ip_stats):
@@ -251,6 +303,8 @@ def main() -> int:
 
     if args.unsuccessful_threshold < 0:
         parser.error("--unsuccessful-threshold must be >= 0")
+    if args.successful_threshold < 0:
+        parser.error("--successful-threshold must be >= 0")
 
     input_handle = open_input(args.input)
     output_handle = open_output(args.output)
@@ -267,8 +321,10 @@ def main() -> int:
         kept, filtered, summary = apply_filters(
             entries,
             bot_regex,
+            args.required_referer_substring,
             ip_stats,
             args.unsuccessful_threshold,
+            args.successful_threshold,
         )
 
         for entry in kept:

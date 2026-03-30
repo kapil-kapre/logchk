@@ -13,7 +13,8 @@ The tool parses each line into a structure containing:
 Then it applies these passes in order:
 1. filter out bots/scanners by user-agent
 2. filter out entries whose status is not `200`
-3. filter out remaining entries whose IP has more than `2` unsuccessful requests
+3. filter out remaining entries whose IP has more than `2` unsuccessful requests or fewer than a configured minimum successful count
+4. filter out entries whose referer does not contain `kapre.in`
 
 `unsuccessful` means parsed entries from that IP with status not equal to `200`.
 
@@ -67,6 +68,18 @@ Adjust IP unsuccessful threshold (default is 2):
 
 ```bash
 python logchk.py access.log --unsuccessful-threshold 2
+```
+
+Set minimum successful count required per IP (default is 0):
+
+```bash
+python logchk.py access.log --successful-threshold 3
+```
+
+Override the required referer substring for pass 4:
+
+```bash
+python logchk.py access.log --required-referer-substring kapre.in
 ```
 
 ## Summary Fields
